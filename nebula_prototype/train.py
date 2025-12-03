@@ -10,8 +10,8 @@ from data.fineweb_loader import get_dataloader
 @dataclass
 class Config:
     d_model: int = 1024       # Scaled up
-    num_layers: int = 32      # Scaled up
-    num_heads: int = 8        # Adjusted for d_model
+    num_layers: int = 16      # Scaled up
+    num_heads: int = 16        # Adjusted for d_model
     vocab_size: int = 50257   # GPT-2
     lr: float = 3e-4          # Standard for this size
     batch_size: int = 16      # H100 can handle this (or more)
