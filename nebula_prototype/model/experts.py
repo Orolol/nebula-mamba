@@ -2,70 +2,29 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-class BatchedExpertPool(nn.Module):
-    def __init__(self, d_model, num_experts, expert_dim):
-        super().__init__()
-        self.num_experts = num_experts
-        self.d_model = d_model
-        self.expert_dim = expert_dim
-        
-        # Weights: [NumExperts, D_model, Expert_Dim]
-        self.w1 = nn.Parameter(torch.randn(num_experts, d_model, expert_dim) * 0.02)
-        self.b1 = nn.Parameter(torch.zeros(num_experts, expert_dim))
-        
-        # Weights: [NumExperts, Expert_Dim, D_model]
-        self.w2 = nn.Parameter(torch.randn(num_experts, expert_dim, d_model) * 0.02)
-        self.b2 = nn.Parameter(torch.zeros(num_experts, d_model))
-        
-    def forward(self, x, weights):
-        """
-        x: [B, L, D] (Input to all experts)
-        weights: [B, L, NumExperts] (Routing weights)
-        """
-        # Dense MoE computation: Compute all experts, then weight sum.
-        # Efficient for small num_experts (e.g. 4-8).
-        
-        # 1. Project to Expert Dim: [B, L, E, Expert_Dim]
-        # x: [B, L, D] -> [B, L, 1, D]
-        # w1: [E, D, H]
-        # einsum: bld, edh -> bleh
-        h = torch.einsum('bld,edh->bleh', x, self.w1) + self.b1.view(1, 1, self.num_experts, self.expert_dim)
-        
-        # 2. Activation
-        h = F.gelu(h)
-        
-        # 3. Project back: [B, L, E, D]
-        # w2: [E, H, D]
-        # einsum: bleh, ehd -> bled
-        out = torch.einsum('bleh,ehd->bled', h, self.w2) + self.b2.view(1, 1, self.num_experts, self.d_model)
-        
-        # 4. Weighted Sum
-        # weights: [B, L, E] -> [B, L, E, 1]
-        # out: [B, L, E, D]
-        # sum over E
-        final_out = (out * weights.unsqueeze(-1)).sum(dim=2)
-        
-        return final_out
-
-class SpatialExpertsLayer(nn.Module):
+class VectorizedSpatialExpertsLayer(nn.Module):
     def __init__(self, d_model, num_heads=4, num_experts_per_pool=4, expert_dim=None):
         super().__init__()
         self.d_model = d_model
         self.num_heads = num_heads
         self.head_dim = d_model // num_heads
+        self.num_experts = num_experts_per_pool
+        
         if expert_dim is None:
             expert_dim = self.head_dim * 4 
+        self.expert_dim = expert_dim
             
-        # Batched Expert Pools (one per head)
-        self.expert_pools = nn.ModuleList([
-            BatchedExpertPool(self.head_dim, num_experts_per_pool, expert_dim)
-            for _ in range(num_heads)
-        ])
+        # Router Weights: [NumHeads, HeadDim, NumExperts]
+        self.router_w = nn.Parameter(torch.randn(num_heads, self.head_dim, num_experts_per_pool) * 0.02)
+        self.router_b = nn.Parameter(torch.zeros(num_heads, num_experts_per_pool))
         
-        # Routers (one per head)
-        self.routers = nn.ModuleList([
-            nn.Linear(self.head_dim, num_experts_per_pool) for _ in range(num_heads)
-        ])
+        # Expert Weights 1: [NumHeads, NumExperts, HeadDim, ExpertDim]
+        self.expert_w1 = nn.Parameter(torch.randn(num_heads, num_experts_per_pool, self.head_dim, expert_dim) * 0.02)
+        self.expert_b1 = nn.Parameter(torch.zeros(num_heads, num_experts_per_pool, expert_dim))
+        
+        # Expert Weights 2: [NumHeads, NumExperts, ExpertDim, HeadDim]
+        self.expert_w2 = nn.Parameter(torch.randn(num_heads, num_experts_per_pool, expert_dim, self.head_dim) * 0.02)
+        self.expert_b2 = nn.Parameter(torch.zeros(num_heads, num_experts_per_pool, self.head_dim))
         
         # Fusion
         self.output_proj = nn.Linear(d_model, d_model)
@@ -73,42 +32,52 @@ class SpatialExpertsLayer(nn.Module):
     def forward(self, x, mask_info=None):
         # x: [B, L, D]
         B, L, D = x.shape
+        H = self.num_heads
+        E = self.num_experts
+        D_h = self.head_dim
         
-        # Split into heads: [B, L, H, D_h]
-        x_heads = x.view(B, L, self.num_heads, self.head_dim)
+        # 1. Split into heads: [B, L, H, D_h]
+        x_heads = x.view(B, L, H, D_h)
         
-        head_outputs = []
+        # 2. Routing
+        # x_heads: [B, L, H, D_h]
+        # router_w: [H, D_h, E]
+        # logits: [B, L, H, E]
+        router_logits = torch.einsum('blhd,hde->blhe', x_heads, self.router_w) + self.router_b.view(1, 1, H, E)
+        router_probs = F.softmax(router_logits, dim=-1) # [B, L, H, E]
         
-        for h in range(self.num_heads):
-            # Input for this head: [B, L, D_h]
-            h_input = x_heads[:, :, h, :]
-            
-            # Routing logits: [B, L, NumExperts]
-            router_logits = self.routers[h](h_input)
-            router_probs = F.softmax(router_logits, dim=-1)
-            
-            # For Dense Batched MoE, we can just use the probabilities directly (Soft MoE)
-            # Or we can mask out non-top-k to keep the sparsity property (Hard MoE)
-            
-            # Hard MoE (Top-K=2)
-            topk_probs, topk_indices = torch.topk(router_probs, k=2, dim=-1)
-            
-            # Create a sparse weight matrix [B, L, E]
-            # Initialize with zeros
-            sparse_weights = torch.zeros_like(router_probs)
-            # Scatter topk probs
-            sparse_weights.scatter_(-1, topk_indices, topk_probs)
-            
-            # Normalize weights so they sum to 1 (optional, but good for stability)
-            sparse_weights = sparse_weights / (sparse_weights.sum(dim=-1, keepdim=True) + 1e-6)
-            
-            # Compute using Batched Pool
-            h_out = self.expert_pools[h](h_input, sparse_weights)
-            
-            head_outputs.append(h_out)
-            
-        # Concatenate heads: [B, L, D]
-        x_fused = torch.cat(head_outputs, dim=-1)
+        # Hard MoE (Top-K=2)
+        topk_probs, topk_indices = torch.topk(router_probs, k=2, dim=-1)
         
-        # Final projection
-        return self.output_proj(x_fused) + x # Residual connection
+        # Sparse weights: [B, L, H, E]
+        sparse_weights = torch.zeros_like(router_probs)
+        sparse_weights.scatter_(-1, topk_indices, topk_probs)
+        sparse_weights = sparse_weights / (sparse_weights.sum(dim=-1, keepdim=True) + 1e-6)
+        
+        # 3. Expert Computation (Vectorized)
+        
+        # Project to Expert Dim: [B, L, H, E, Expert_Dim]
+        # x_heads: [B, L, H, D_h] -> [B, L, H, 1, D_h]
+        # expert_w1: [H, E, D_h, Expert_Dim]
+        # out: [B, L, H, E, Expert_Dim]
+        h = torch.einsum('blhd,hedf->blhef', x_heads, self.expert_w1) + self.expert_b1.view(1, 1, H, E, self.expert_dim)
+        
+        h = F.gelu(h)
+        
+        # Project back: [B, L, H, E, D_h]
+        # expert_w2: [H, E, Expert_Dim, D_h]
+        out = torch.einsum('blhef,hefd->blhed', h, self.expert_w2) + self.expert_b2.view(1, 1, H, E, D_h)
+        
+        # 4. Weighted Sum (Routing)
+        # sparse_weights: [B, L, H, E] -> [B, L, H, E, 1]
+        # out: [B, L, H, E, D_h]
+        # sum over E -> [B, L, H, D_h]
+        head_out = (out * sparse_weights.unsqueeze(-1)).sum(dim=3)
+        
+        # 5. Fuse Heads
+        x_fused = head_out.view(B, L, D)
+        
+        return self.output_proj(x_fused) + x
+
+# Alias for compatibility
+SpatialExpertsLayer = VectorizedSpatialExpertsLayer
