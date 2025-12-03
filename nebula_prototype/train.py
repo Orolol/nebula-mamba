@@ -5,11 +5,13 @@ import argparse
 import wandb
 import sys
 from torch.utils.tensorboard import SummaryWriter
+from torch.utils.data import DataLoader
 from tqdm import tqdm
+from transformers import GPT2TokenizerFast
 from model.nebula import NebulaModel
 from model.diffusion import DiffusionHead
 from model.config import NEBULA_CONFIGS
-from data.fineweb_loader import get_dataloader
+from data.data_loader_packed import PackedFinewebDataset
 
 def count_parameters(model):
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -21,11 +23,6 @@ def train(args):
     
     config = NEBULA_CONFIGS[args.config]
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    
-    # Optimization: Tensor Cores
-    if torch.cuda.is_available():
-        torch.set_float32_matmul_precision('high')
-        
     print(f"Using device: {device}")
     print(f"Loading config: {args.config}")
     
@@ -58,13 +55,27 @@ def train(args):
     diffusion_helper = DiffusionHead(config.vocab_size)
     mask_token_id = 50256 # GPT-2 EOS as mask
     
-    # Data (Optimized)
-    # Increase num_workers for H100 to avoid CPU bottleneck
-    dataloader = get_dataloader(split="train", seq_len=config.seq_len, batch_size=config.batch_size, num_workers=8)
+    # Data (Packed & Optimized)
+    print("Initializing PackedFinewebDataset...")
+    tokenizer = GPT2TokenizerFast.from_pretrained("gpt2")
+    tokenizer.pad_token = tokenizer.eos_token
+    
+    dataset = PackedFinewebDataset(
+        split="train",
+        max_length=config.seq_len,
+        batch_size=config.batch_size,
+        tokenizer=tokenizer,
+        buffer_docs=10000, # Large buffer for better packing
+        prefetch_batches=32
+    )
+    
+    # Packed dataset handles batching internally, so batch_size=None
+    # It also has its own producer thread, so num_workers=0 is usually best to avoid overhead/duplication
+    dataloader = DataLoader(dataset, batch_size=None, num_workers=0, pin_memory=True)
     
     model.train()
     
-    print("Starting training with BF16 Mixed Precision...")
+    print("Starting training with BF16 Mixed Precision & Packed Loader...")
     step = 0
     pbar = tqdm(total=config.num_steps)
     
@@ -73,22 +84,23 @@ def train(args):
     total_tokens_trained = 0
     
     # BF16 Context
-    # H100 supports BF16 natively.
     dtype = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.float16
     print(f"Using Mixed Precision: {dtype}")
     
-    for input_ids, _ in dataloader:
+    for batch in dataloader:
         if step >= config.num_steps:
             break
             
-        input_ids = input_ids.to(device)
+        # Packed loader returns dict
+        input_ids = batch["input_ids"].to(device)
         
         # Calculate tokens per second (excluding padding)
-        pad_token_id = 50256
+        pad_token_id = tokenizer.pad_token_id
         num_tokens = (input_ids != pad_token_id).sum().item()
         total_tokens_trained += num_tokens
         
         # Forward Diffusion
+        # Note: We ignore batch['labels'] (AR labels) and generate diffusion masks
         masked_input, labels, mask_mask = diffusion_helper.forward_diffusion(input_ids, mask_token_id)
         
         optimizer.zero_grad()
