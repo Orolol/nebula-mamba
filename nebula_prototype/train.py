@@ -14,7 +14,7 @@ class Config:
     num_heads: int = 16        # Adjusted for d_model
     vocab_size: int = 50257   # GPT-2
     lr: float = 3e-4          # Standard for this size
-    batch_size: int = 8      # H100 can handle this (or more)
+    batch_size: int = 32      # H100 can handle this (or more)
     seq_len: int = 1024       # Standard context
     num_steps: int = 1000     # Longer run
 
