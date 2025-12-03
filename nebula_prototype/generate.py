@@ -31,7 +31,7 @@ def generate(args):
     # In a real diffusion model, we'd use a noise scheduler. 
     # Here we do "Mask-Predict-Iterative" (like MaskGIT)
     
-    num_steps = 10 # Number of unmasking steps
+    num_steps = 20 # Number of unmasking steps
     print("Generating...")
     
     for step in range(num_steps):
