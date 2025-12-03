@@ -44,9 +44,18 @@ def train(args):
     print(f"Model initialized with {num_params:,} parameters.")
     
     # 4. Compilation (Torch 2.0+)
+    # 4. Compilation (Torch 2.0+)
     if args.compile:
-        print("Compiling model with torch.compile...")
-        model = torch.compile(model)
+        print("Compiling Experts and Diffusion Head with torch.compile...")
+        # Compile experts in each layer to avoid Mamba graph breaks
+        for layer in model.layers:
+            layer['experts'] = torch.compile(layer['experts'])
+        
+        # Compile diffusion head
+        model.diffusion_head = torch.compile(model.diffusion_head)
+        
+        # Note: We do NOT compile the full model or the Mamba blocks
+        # because Mamba's CUDA kernels currently cause graph breaks/issues with Dynamo.
 
     optimizer = optim.AdamW(model.parameters(), lr=config.lr)
     criterion = nn.CrossEntropyLoss()
@@ -173,17 +182,17 @@ def train(args):
         pbar.update(1)
         step += 1
         
-        # Print timing breakdown every 10 steps
-        if step % 10 == 0:
-            total_time = sum(timers.values())
-            print(f"\n[Step {step}] Timing Breakdown (avg over 10 steps):")
-            print(f"  Data Load: {timers['data']*1000/10:.1f}ms")
-            print(f"  Diffusion: {timers['diffusion']*1000/10:.1f}ms")
-            print(f"  Forward:   {timers['forward']*1000/10:.1f}ms")
-            print(f"  Backward:  {timers['backward']*1000/10:.1f}ms")
-            print(f"  Optimizer: {timers['optim']*1000/10:.1f}ms")
-            # Reset timers
-            for k in timers: timers[k] = 0.0
+        # # Print timing breakdown every 10 steps
+        # if step % 10 == 0:
+        #     total_time = sum(timers.values())
+        #     print(f"\n[Step {step}] Timing Breakdown (avg over 10 steps):")
+        #     print(f"  Data Load: {timers['data']*1000/10:.1f}ms")
+        #     print(f"  Diffusion: {timers['diffusion']*1000/10:.1f}ms")
+        #     print(f"  Forward:   {timers['forward']*1000/10:.1f}ms")
+        #     print(f"  Backward:  {timers['backward']*1000/10:.1f}ms")
+        #     print(f"  Optimizer: {timers['optim']*1000/10:.1f}ms")
+        #     # Reset timers
+        #     for k in timers: timers[k] = 0.0
             
         t_start_step = time.time()
 
