@@ -44,7 +44,6 @@ def train(args):
     print(f"Model initialized with {num_params:,} parameters.")
     
     # 4. Compilation (Torch 2.0+)
-    # 4. Compilation (Torch 2.0+)
     if args.compile:
         print("Compiling Experts and Diffusion Head with torch.compile...")
         # Compile experts in each layer to avoid Mamba graph breaks
@@ -84,9 +83,9 @@ def train(args):
     
     model.train()
     
-    # ... (previous setup code) ...
-    
     print("Starting training with BF16 Mixed Precision & Fast Loader...")
+    print(f"Token-based Gradient Accumulation: Target = {args.target_tokens} tokens/step")
+    
     step = 0
     pbar = tqdm(total=config.num_steps)
     
@@ -110,6 +109,8 @@ def train(args):
     }
     
     t_start_step = time.time()
+    accumulated_tokens = 0
+    optimizer.zero_grad()
     
     for batch in dataloader:
         t_data_end = time.time()
@@ -132,8 +133,6 @@ def train(args):
         torch.cuda.synchronize()
         timers["diffusion"] += (time.time() - t_diff_start)
         
-        optimizer.zero_grad()
-        
         # Mixed Precision Forward
         t_fwd_start = time.time()
         with torch.amp.autocast(device_type='cuda', dtype=dtype):
@@ -143,56 +142,71 @@ def train(args):
             logits_flat = logits.view(-1, config.vocab_size)
             labels_flat = labels.view(-1)
             loss = criterion(logits_flat, labels_flat)
+            
+            # Scale loss for token-based accumulation
+            # We want the gradient to be weighted by the number of tokens in this batch
+            # relative to the target number of tokens per step.
+            scaled_loss = loss * (num_tokens / args.target_tokens)
+            
         torch.cuda.synchronize()
         timers["forward"] += (time.time() - t_fwd_start)
         
         # Backward
         t_bwd_start = time.time()
-        loss.backward()
+        scaled_loss.backward()
         torch.cuda.synchronize()
         timers["backward"] += (time.time() - t_bwd_start)
         
-        # Optimizer
-        t_opt_start = time.time()
-        optimizer.step()
-        torch.cuda.synchronize()
-        timers["optim"] += (time.time() - t_opt_start)
+        accumulated_tokens += num_tokens
         
-        # Metrics
-        t1 = time.time()
-        dt = t1 - t0
-        t0 = t1
-        tokens_per_sec = num_tokens / dt
-        
-        # Logging
-        loss_val = loss.item()
-        writer.add_scalar("Loss/train", loss_val, step)
-        writer.add_scalar("Perf/tokens_per_sec", tokens_per_sec, step)
-        writer.add_scalar("Perf/total_tokens", total_tokens_trained, step)
-        
-        if args.use_wandb:
-            wandb.log({
-                "loss": loss_val, 
-                "tokens_per_sec": tokens_per_sec,
-                "total_tokens": total_tokens_trained,
-                "step": step
-            })
+        # Optimizer Step (only if target tokens reached)
+        if accumulated_tokens >= args.target_tokens:
+            t_opt_start = time.time()
+            optimizer.step()
+            optimizer.zero_grad()
+            torch.cuda.synchronize()
+            timers["optim"] += (time.time() - t_opt_start)
             
-        pbar.set_description(f"Loss: {loss_val:.4f} | TPS: {tokens_per_sec:.0f}")
-        pbar.update(1)
-        step += 1
-        
-        # # Print timing breakdown every 10 steps
-        # if step % 10 == 0:
-        #     total_time = sum(timers.values())
-        #     print(f"\n[Step {step}] Timing Breakdown (avg over 10 steps):")
-        #     print(f"  Data Load: {timers['data']*1000/10:.1f}ms")
-        #     print(f"  Diffusion: {timers['diffusion']*1000/10:.1f}ms")
-        #     print(f"  Forward:   {timers['forward']*1000/10:.1f}ms")
-        #     print(f"  Backward:  {timers['backward']*1000/10:.1f}ms")
-        #     print(f"  Optimizer: {timers['optim']*1000/10:.1f}ms")
-        #     # Reset timers
-        #     for k in timers: timers[k] = 0.0
+            # Metrics (recorded only on step)
+            t1 = time.time()
+            dt = t1 - t0
+            t0 = t1
+            # TPS is based on total tokens processed since last step
+            tokens_per_sec = accumulated_tokens / dt
+            
+            # Logging
+            loss_val = loss.item() # Note: this is the loss of the LAST micro-batch, not average. 
+                                   # For smoother logs, we could accumulate loss value too, but this is acceptable.
+            
+            writer.add_scalar("Loss/train", loss_val, step)
+            writer.add_scalar("Perf/tokens_per_sec", tokens_per_sec, step)
+            writer.add_scalar("Perf/total_tokens", total_tokens_trained, step)
+            
+            if args.use_wandb:
+                wandb.log({
+                    "loss": loss_val, 
+                    "tokens_per_sec": tokens_per_sec,
+                    "total_tokens": total_tokens_trained,
+                    "step": step
+                })
+                
+            pbar.set_description(f"Loss: {loss_val:.4f} | TPS: {tokens_per_sec:.0f}")
+            pbar.update(1)
+            step += 1
+            
+            # Print timing breakdown every 10 steps
+            if step % 10 == 0:
+                total_time = sum(timers.values())
+                print(f"\n[Step {step}] Timing Breakdown (avg over 10 steps):")
+                print(f"  Data Load: {timers['data']*1000/10:.1f}ms")
+                print(f"  Diffusion: {timers['diffusion']*1000/10:.1f}ms")
+                print(f"  Forward:   {timers['forward']*1000/10:.1f}ms")
+                print(f"  Backward:  {timers['backward']*1000/10:.1f}ms")
+                print(f"  Optimizer: {timers['optim']*1000/10:.1f}ms")
+                # Reset timers
+                for k in timers: timers[k] = 0.0
+            
+            accumulated_tokens = 0
             
         t_start_step = time.time()
 
@@ -210,6 +224,7 @@ if __name__ == "__main__":
     parser.add_argument("--run_name", type=str, default="nebula_run", help="Name for logs and checkpoint")
     parser.add_argument("--use_wandb", action="store_true", help="Enable WandB logging")
     parser.add_argument("--compile", action="store_true", help="Enable torch.compile")
+    parser.add_argument("--target_tokens", type=int, default=65536, help="Target number of tokens per optimizer step (Gradient Accumulation)")
     args = parser.parse_args()
     
     # Create dirs
