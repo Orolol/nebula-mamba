@@ -189,16 +189,20 @@ class FastFinewebDataset(IterableDataset):
             start = end
         return chunks
 
-    def _build_batch(self, docs_buffer: deque) -> Optional[Dict[str, torch.Tensor]]:
-        if len(docs_buffer) < self.batch_size:
+    def _build_batch(self, batch_docs: List[torch.Tensor]) -> Optional[Dict[str, torch.Tensor]]:
+        if len(batch_docs) < self.batch_size:
             return None
 
-        input_ids = torch.full((self.batch_size, self.max_length), self.pad_id, dtype=torch.long)
-        attention_mask = torch.zeros((self.batch_size, self.max_length), dtype=torch.long)
+        # Dynamic Padding: Find max length in this specific batch
+        max_len_in_batch = max(len(d) for d in batch_docs)
+        # Ensure we don't exceed global max_length (though _split_long should prevent this)
+        batch_seq_len = min(max_len_in_batch, self.max_length)
 
-        for i in range(self.batch_size):
-            doc = docs_buffer.popleft()
-            length = min(doc.numel(), self.max_length)
+        input_ids = torch.full((self.batch_size, batch_seq_len), self.pad_id, dtype=torch.long)
+        attention_mask = torch.zeros((self.batch_size, batch_seq_len), dtype=torch.long)
+
+        for i, doc in enumerate(batch_docs):
+            length = min(doc.numel(), batch_seq_len)
             input_ids[i, :length] = doc[:length]
             attention_mask[i, :length] = 1
 
@@ -222,60 +226,15 @@ class FastFinewebDataset(IterableDataset):
     def _producer(self):
         try:
             it = iter(self.dataset)
-            # Use a list for the buffer to allow shuffling/random sampling
             docs_buffer: List[torch.Tensor] = []
             example_count = 0
             
-            # 1. Initial Fill
-            print(f"[FastDataset] Filling buffer ({self.buffer_docs} docs)...")
-            while len(docs_buffer) < self.buffer_docs and not self.should_stop.is_set():
-                try:
-                    ex = next(it)
-                    example_count += 1
-                    if self.world_size > 1 and example_count % self.world_size != self.rank:
-                        continue
-                except StopIteration:
-                    it = iter(self.dataset)
-                    example_count = 0
-                    continue
-                
-                ids = self._tokenize_text(ex["text"])
-                chunks = self._split_long(ids)
-                docs_buffer.extend(chunks)
-            
-            if self.shuffle:
-                random.shuffle(docs_buffer)
-                
-            print(f"[FastDataset] Buffer filled. Starting batch production.")
+            print(f"[FastDataset] Starting Smart Batching Producer (Buffer: {self.buffer_docs})...")
 
-            # 2. Continuous Loop
             while not self.should_stop.is_set():
-                # If we have enough data, produce a batch
-                if len(docs_buffer) >= self.batch_size:
-                    # Take batch_size docs
-                    batch_docs = []
-                    for _ in range(self.batch_size):
-                        batch_docs.append(docs_buffer.pop(0))
-                    
-                    # Build batch
-                    # We need a deque for _build_batch compatibility or just pass list
-                    # _build_batch expects deque and pops from left. 
-                    # Let's adapt _build_batch logic inline or wrap in deque
-                    batch_deque = deque(batch_docs)
-                    batch = self._build_batch(batch_deque)
-                    
-                    if batch is not None:
-                        if not self.batch_queue.put(batch):
-                            break
-                        self.stats["batches_built"] += 1
-                
-                # Refill buffer (maintain size)
-                # We consumed batch_size docs, so try to fetch at least that many
-                # But don't block indefinitely if dataset is slow, just fetch a chunk
-                target_fill = self.buffer_docs
-                fetched_count = 0
-                
-                while len(docs_buffer) < target_fill and not self.should_stop.is_set():
+                # 1. Fill Buffer
+                # We need enough docs to form several batches to make sorting effective
+                while len(docs_buffer) < self.buffer_docs and not self.should_stop.is_set():
                     try:
                         ex = next(it)
                         example_count += 1
@@ -285,20 +244,47 @@ class FastFinewebDataset(IterableDataset):
                         it = iter(self.dataset)
                         example_count = 0
                         continue
-                        
+                    
                     ids = self._tokenize_text(ex["text"])
                     chunks = self._split_long(ids)
                     docs_buffer.extend(chunks)
-                    fetched_count += 1
-                    
-                    # If we fetched enough to cover what we consumed, break to check queue
-                    # This prevents blocking for too long if buffer is huge
-                    if fetched_count >= self.batch_size * 2: 
-                        break
                 
-                # If buffer is too empty to produce, sleep briefly
-                if len(docs_buffer) < self.batch_size:
-                    time.sleep(0.01)
+                if self.should_stop.is_set():
+                    break
+
+                # 2. Smart Batching Strategy
+                # Sort by length to group similar sized sequences
+                # This minimizes padding within each batch
+                if self.shuffle:
+                    # Add a tiny bit of noise to length to avoid deterministic ordering of identical lengths?
+                    # For now, simple sort is fine.
+                    docs_buffer.sort(key=lambda x: len(x))
+                
+                # 3. Create Batches
+                batches = []
+                while len(docs_buffer) >= self.batch_size:
+                    # Take the next batch_size elements (which are similar in length)
+                    batch_docs = [docs_buffer.pop(0) for _ in range(self.batch_size)]
+                    batches.append(batch_docs)
+                
+                # 4. Shuffle Batches
+                # We want to yield batches in random order to preserve stochasticity
+                if self.shuffle:
+                    random.shuffle(batches)
+                
+                # 5. Enqueue Batches
+                for b_docs in batches:
+                    if self.should_stop.is_set():
+                        break
+                    
+                    batch = self._build_batch(b_docs)
+                    if batch is not None:
+                        if not self.batch_queue.put(batch):
+                            self.should_stop.set()
+                            break
+                        self.stats["batches_built"] += 1
+                
+                # Note: Leftover docs ( < batch_size) remain in docs_buffer for next round
 
         except BaseException as e:
             self.exception = e
