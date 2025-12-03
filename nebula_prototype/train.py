@@ -54,11 +54,19 @@ def train(args):
     step = 0
     pbar = tqdm(total=config.num_steps)
     
+    import time
+    t0 = time.time()
+    
     for input_ids, _ in dataloader:
         if step >= config.num_steps:
             break
             
         input_ids = input_ids.to(device)
+        
+        # Calculate tokens per second (excluding padding)
+        # Assuming pad_token_id is 50256 (same as mask/eos for GPT-2)
+        pad_token_id = 50256
+        num_tokens = (input_ids != pad_token_id).sum().item()
         
         # Forward Diffusion
         masked_input, labels, mask_mask = diffusion_helper.forward_diffusion(input_ids, mask_token_id)
@@ -76,13 +84,25 @@ def train(args):
         loss.backward()
         optimizer.step()
         
+        # Metrics
+        t1 = time.time()
+        dt = t1 - t0
+        t0 = t1
+        tokens_per_sec = num_tokens / dt
+        
         # Logging
         loss_val = loss.item()
         writer.add_scalar("Loss/train", loss_val, step)
+        writer.add_scalar("Perf/tokens_per_sec", tokens_per_sec, step)
+        
         if args.use_wandb:
-            wandb.log({"loss": loss_val, "step": step})
+            wandb.log({
+                "loss": loss_val, 
+                "tokens_per_sec": tokens_per_sec,
+                "step": step
+            })
             
-        pbar.set_description(f"Loss: {loss_val:.4f}")
+        pbar.set_description(f"Loss: {loss_val:.4f} | TPS: {tokens_per_sec:.0f}")
         pbar.update(1)
         step += 1
 
