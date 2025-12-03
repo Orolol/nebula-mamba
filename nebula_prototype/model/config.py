@@ -32,6 +32,6 @@ NEBULA_CONFIGS = {
         d_model=1024,
         num_layers=24, # Adjusted to hit ~500M with d_model=1024
         num_heads=16,
-        batch_size=8 # Adjust based on VRAM
+        batch_size=16 # Adjust based on VRAM
     )
 }
