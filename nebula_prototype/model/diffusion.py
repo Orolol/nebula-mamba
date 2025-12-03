@@ -32,7 +32,12 @@ class DiffusionHead(nn.Module):
         
         # Labels: we only compute loss on masked tokens
         labels = input_ids.clone()
-        labels[~mask_mask] = -100 # Ignore index
+        labels[~mask_mask] = -100 # Ignore unmasked tokens
+        
+        # Also ignore padding tokens in the original input
+        # Assuming pad_token_id is 50256 (same as mask/eos for GPT-2)
+        pad_token_id = 50256
+        labels[input_ids == pad_token_id] = -100
         
         return masked_input_ids, labels, mask_mask
 
