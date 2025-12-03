@@ -1,16 +1,6 @@
 import torch
 import torch.nn as nn
-try:
-    from mamba_ssm import Mamba
-except ImportError:
-    print("Mamba-SSM not installed. Using mock for testing.")
-    class Mamba(nn.Module):
-        def __init__(self, d_model, d_state=16, d_conv=4, expand=2):
-            super().__init__()
-            self.d_model = d_model
-            self.linear = nn.Linear(d_model, d_model)
-        def forward(self, x):
-            return self.linear(x)
+from mamba_ssm import Mamba
 
 class BiMambaBlock(nn.Module):
     def __init__(self, d_model, d_state=16, d_conv=4, expand=2):

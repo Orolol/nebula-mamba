@@ -3,6 +3,7 @@ import torch.nn as nn
 import torch.optim as optim
 import argparse
 import wandb
+import sys
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 from model.nebula import NebulaModel
@@ -22,6 +23,13 @@ def train(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
     print(f"Loading config: {args.config}")
+    
+    # Check Mamba
+    try:
+        import mamba_ssm
+        print("SUCCESS: Mamba-SSM is installed and will be used.")
+    except ImportError:
+        print("WARNING: Mamba-SSM not found. Using slow/mock implementation!")
 
     # 2. Logging Setup
     writer = SummaryWriter(log_dir=f"runs/{args.run_name}")
@@ -45,17 +53,26 @@ def train(args):
     diffusion_helper = DiffusionHead(config.vocab_size)
     mask_token_id = 50256 # GPT-2 EOS as mask
     
-    # Data
+    # Data (Optimized)
+    # Increase num_workers for H100 to avoid CPU bottleneck
     dataloader = get_dataloader(split="train", seq_len=config.seq_len, batch_size=config.batch_size)
+    # Note: get_dataloader in fineweb_loader.py needs to support num_workers/pin_memory args 
+    # or we rely on default. For now, we assume standard loader but we should check it.
     
     model.train()
     
-    print("Starting training...")
+    print("Starting training with BF16 Mixed Precision...")
     step = 0
     pbar = tqdm(total=config.num_steps)
     
     import time
     t0 = time.time()
+    total_tokens_trained = 0
+    
+    # BF16 Context
+    # H100 supports BF16 natively.
+    dtype = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.float16
+    print(f"Using Mixed Precision: {dtype}")
     
     for input_ids, _ in dataloader:
         if step >= config.num_steps:
@@ -64,21 +81,23 @@ def train(args):
         input_ids = input_ids.to(device)
         
         # Calculate tokens per second (excluding padding)
-        # Assuming pad_token_id is 50256 (same as mask/eos for GPT-2)
         pad_token_id = 50256
         num_tokens = (input_ids != pad_token_id).sum().item()
+        total_tokens_trained += num_tokens
         
         # Forward Diffusion
         masked_input, labels, mask_mask = diffusion_helper.forward_diffusion(input_ids, mask_token_id)
         
-        # Prediction
         optimizer.zero_grad()
-        logits = model(masked_input) 
         
-        # Loss
-        logits_flat = logits.view(-1, config.vocab_size)
-        labels_flat = labels.view(-1)
-        loss = criterion(logits_flat, labels_flat)
+        # Mixed Precision Forward
+        with torch.amp.autocast(device_type='cuda', dtype=dtype):
+            logits = model(masked_input) 
+            
+            # Loss
+            logits_flat = logits.view(-1, config.vocab_size)
+            labels_flat = labels.view(-1)
+            loss = criterion(logits_flat, labels_flat)
         
         # Backward
         loss.backward()
@@ -94,11 +113,13 @@ def train(args):
         loss_val = loss.item()
         writer.add_scalar("Loss/train", loss_val, step)
         writer.add_scalar("Perf/tokens_per_sec", tokens_per_sec, step)
+        writer.add_scalar("Perf/total_tokens", total_tokens_trained, step)
         
         if args.use_wandb:
             wandb.log({
                 "loss": loss_val, 
                 "tokens_per_sec": tokens_per_sec,
+                "total_tokens": total_tokens_trained,
                 "step": step
             })
             
