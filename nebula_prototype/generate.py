@@ -17,7 +17,18 @@ def generate(args):
     # Note: If model was compiled, state_dict keys might have '_orig_mod' prefix. 
     # For prototype simplicity, we assume standard loading or user handles prefix.
     state_dict = torch.load(args.checkpoint, map_location=device)
-    model.load_state_dict(state_dict)
+    
+    # Fix for torch.compile: strip '_orig_mod.' prefix if present
+    new_state_dict = {}
+    for k, v in state_dict.items():
+        if k.startswith("_orig_mod."):
+            new_state_dict[k[10:]] = v
+        elif "._orig_mod." in k:
+            new_state_dict[k.replace("._orig_mod.", ".")] = v
+        else:
+            new_state_dict[k] = v
+            
+    model.load_state_dict(new_state_dict)
     model.eval()
     
     tokenizer = GPT2TokenizerFast.from_pretrained("gpt2")

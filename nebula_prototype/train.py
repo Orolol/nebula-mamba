@@ -215,7 +215,18 @@ def train(args):
         wandb.finish()
         
     # Save checkpoint
-    torch.save(model.state_dict(), f"checkpoints/{args.run_name}.pt")
+    # Sanitize state_dict keys (remove _orig_mod prefix from torch.compile)
+    state_dict = model.state_dict()
+    new_state_dict = {}
+    for k, v in state_dict.items():
+        if k.startswith("_orig_mod."):
+            new_state_dict[k[10:]] = v
+        elif "._orig_mod." in k:
+            new_state_dict[k.replace("._orig_mod.", ".")] = v
+        else:
+            new_state_dict[k] = v
+            
+    torch.save(new_state_dict, f"checkpoints/{args.run_name}.pt")
     print(f"Saved checkpoint to checkpoints/{args.run_name}.pt")
 
 if __name__ == "__main__":
