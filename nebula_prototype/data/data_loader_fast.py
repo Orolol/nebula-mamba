@@ -222,49 +222,87 @@ class FastFinewebDataset(IterableDataset):
     def _producer(self):
         try:
             it = iter(self.dataset)
-            docs: List[torch.Tensor] = []
-            docs_deque: deque = deque()
+            # Use a list for the buffer to allow shuffling/random sampling
+            docs_buffer: List[torch.Tensor] = []
             example_count = 0
+            
+            # 1. Initial Fill
+            print(f"[FastDataset] Filling buffer ({self.buffer_docs} docs)...")
+            while len(docs_buffer) < self.buffer_docs and not self.should_stop.is_set():
+                try:
+                    ex = next(it)
+                    example_count += 1
+                    if self.world_size > 1 and example_count % self.world_size != self.rank:
+                        continue
+                except StopIteration:
+                    it = iter(self.dataset)
+                    example_count = 0
+                    continue
+                
+                ids = self._tokenize_text(ex["text"])
+                chunks = self._split_long(ids)
+                docs_buffer.extend(chunks)
+            
+            if self.shuffle:
+                random.shuffle(docs_buffer)
+                
+            print(f"[FastDataset] Buffer filled. Starting batch production.")
 
+            # 2. Continuous Loop
             while not self.should_stop.is_set():
-                # Fill documents buffer
-                while len(docs) < self.buffer_docs and not self.should_stop.is_set():
+                # If we have enough data, produce a batch
+                if len(docs_buffer) >= self.batch_size:
+                    # Take batch_size docs
+                    batch_docs = []
+                    for _ in range(self.batch_size):
+                        batch_docs.append(docs_buffer.pop(0))
+                    
+                    # Build batch
+                    # We need a deque for _build_batch compatibility or just pass list
+                    # _build_batch expects deque and pops from left. 
+                    # Let's adapt _build_batch logic inline or wrap in deque
+                    batch_deque = deque(batch_docs)
+                    batch = self._build_batch(batch_deque)
+                    
+                    if batch is not None:
+                        if not self.batch_queue.put(batch):
+                            break
+                        self.stats["batches_built"] += 1
+                
+                # Refill buffer (maintain size)
+                # We consumed batch_size docs, so try to fetch at least that many
+                # But don't block indefinitely if dataset is slow, just fetch a chunk
+                target_fill = self.buffer_docs
+                fetched_count = 0
+                
+                while len(docs_buffer) < target_fill and not self.should_stop.is_set():
                     try:
                         ex = next(it)
                         example_count += 1
-
-                        if self.world_size > 1:
-                            if example_count % self.world_size != self.rank:
-                                continue
-
+                        if self.world_size > 1 and example_count % self.world_size != self.rank:
+                            continue
                     except StopIteration:
                         it = iter(self.dataset)
                         example_count = 0
                         continue
+                        
                     ids = self._tokenize_text(ex["text"])
                     chunks = self._split_long(ids)
-                    docs.extend(chunks)
-
-                if self.shuffle and len(docs) > 0:
-                    random.shuffle(docs)
-
-                if len(docs_deque) == 0 and len(docs) > 0:
-                    docs_deque = deque(docs)
-                    docs = []
-
-                if len(docs_deque) < self.batch_size:
+                    docs_buffer.extend(chunks)
+                    fetched_count += 1
+                    
+                    # If we fetched enough to cover what we consumed, break to check queue
+                    # This prevents blocking for too long if buffer is huge
+                    if fetched_count >= self.batch_size * 2: 
+                        break
+                
+                # If buffer is too empty to produce, sleep briefly
+                if len(docs_buffer) < self.batch_size:
                     time.sleep(0.01)
-                    continue
-
-                batch = self._build_batch(docs_deque)
-                if batch is None:
-                    continue
-                if not self.batch_queue.put(batch):
-                    break
-                self.stats["batches_built"] += 1
 
         except BaseException as e:
             self.exception = e
+            print(f"[FastDataset] Producer exception: {e}")
         finally:
             self.batch_queue.close()
 
