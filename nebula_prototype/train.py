@@ -75,6 +75,8 @@ def train(args):
     
     model.train()
     
+    # ... (previous setup code) ...
+    
     print("Starting training with BF16 Mixed Precision & Packed Loader...")
     step = 0
     pbar = tqdm(total=config.num_steps)
@@ -87,7 +89,23 @@ def train(args):
     dtype = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.float16
     print(f"Using Mixed Precision: {dtype}")
     
+    # Timing stats
+    timers = {
+        "data": 0.0,
+        "diffusion": 0.0,
+        "forward": 0.0,
+        "loss": 0.0,
+        "backward": 0.0,
+        "optim": 0.0,
+        "total": 0.0
+    }
+    
+    t_start_step = time.time()
+    
     for batch in dataloader:
+        t_data_end = time.time()
+        timers["data"] += (t_data_end - t_start_step)
+        
         if step >= config.num_steps:
             break
             
@@ -100,12 +118,15 @@ def train(args):
         total_tokens_trained += num_tokens
         
         # Forward Diffusion
-        # Note: We ignore batch['labels'] (AR labels) and generate diffusion masks
+        t_diff_start = time.time()
         masked_input, labels, mask_mask = diffusion_helper.forward_diffusion(input_ids, mask_token_id)
+        torch.cuda.synchronize()
+        timers["diffusion"] += (time.time() - t_diff_start)
         
         optimizer.zero_grad()
         
         # Mixed Precision Forward
+        t_fwd_start = time.time()
         with torch.amp.autocast(device_type='cuda', dtype=dtype):
             logits = model(masked_input) 
             
@@ -113,10 +134,20 @@ def train(args):
             logits_flat = logits.view(-1, config.vocab_size)
             labels_flat = labels.view(-1)
             loss = criterion(logits_flat, labels_flat)
+        torch.cuda.synchronize()
+        timers["forward"] += (time.time() - t_fwd_start)
         
         # Backward
+        t_bwd_start = time.time()
         loss.backward()
+        torch.cuda.synchronize()
+        timers["backward"] += (time.time() - t_bwd_start)
+        
+        # Optimizer
+        t_opt_start = time.time()
         optimizer.step()
+        torch.cuda.synchronize()
+        timers["optim"] += (time.time() - t_opt_start)
         
         # Metrics
         t1 = time.time()
@@ -141,6 +172,20 @@ def train(args):
         pbar.set_description(f"Loss: {loss_val:.4f} | TPS: {tokens_per_sec:.0f}")
         pbar.update(1)
         step += 1
+        
+        # Print timing breakdown every 10 steps
+        if step % 10 == 0:
+            total_time = sum(timers.values())
+            print(f"\n[Step {step}] Timing Breakdown (avg over 10 steps):")
+            print(f"  Data Load: {timers['data']*1000/10:.1f}ms")
+            print(f"  Diffusion: {timers['diffusion']*1000/10:.1f}ms")
+            print(f"  Forward:   {timers['forward']*1000/10:.1f}ms")
+            print(f"  Backward:  {timers['backward']*1000/10:.1f}ms")
+            print(f"  Optimizer: {timers['optim']*1000/10:.1f}ms")
+            # Reset timers
+            for k in timers: timers[k] = 0.0
+            
+        t_start_step = time.time()
 
     writer.close()
     if args.use_wandb:
