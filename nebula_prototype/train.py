@@ -9,14 +9,17 @@ from data.fineweb_loader import get_dataloader
 
 @dataclass
 class Config:
-    d_model: int = 256
-    num_layers: int = 4
-    num_heads: int = 4
-    vocab_size: int = 50257 # GPT-2
-    lr: float = 1e-4
-    batch_size: int = 4
-    seq_len: int = 128 # Small for prototype
-    num_steps: int = 100
+    d_model: int = 1024       # Scaled up
+    num_layers: int = 32      # Scaled up
+    num_heads: int = 8        # Adjusted for d_model
+    vocab_size: int = 50257   # GPT-2
+    lr: float = 3e-4          # Standard for this size
+    batch_size: int = 16      # H100 can handle this (or more)
+    seq_len: int = 1024       # Standard context
+    num_steps: int = 1000     # Longer run
+
+def count_parameters(model):
+    return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
 def train():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -24,6 +27,10 @@ def train():
     
     config = Config()
     model = NebulaModel(config).to(device)
+    
+    num_params = count_parameters(model)
+    print(f"Model initialized with {num_params:,} parameters.")
+    
     optimizer = optim.AdamW(model.parameters(), lr=config.lr)
     criterion = nn.CrossEntropyLoss()
     
