@@ -11,7 +11,7 @@ from transformers import GPT2TokenizerFast
 from model.nebula import NebulaModel
 from model.diffusion import DiffusionHead
 from model.config import NEBULA_CONFIGS
-from data.data_loader_packed import PackedFinewebDataset
+from data.data_loader_fast import FastFinewebDataset
 
 def count_parameters(model):
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -55,21 +55,21 @@ def train(args):
     diffusion_helper = DiffusionHead(config.vocab_size)
     mask_token_id = 50256 # GPT-2 EOS as mask
     
-    # Data (Packed & Optimized)
-    print("Initializing PackedFinewebDataset...")
+    # Data (Fast & Unpacked)
+    print("Initializing FastFinewebDataset (Unpacked)...")
     tokenizer = GPT2TokenizerFast.from_pretrained("gpt2")
     tokenizer.pad_token = tokenizer.eos_token
     
-    dataset = PackedFinewebDataset(
+    dataset = FastFinewebDataset(
         split="train",
         max_length=config.seq_len,
         batch_size=config.batch_size,
         tokenizer=tokenizer,
-        buffer_docs=10000, # Large buffer for better packing
+        buffer_docs=10000,
         prefetch_batches=32
     )
     
-    # Packed dataset handles batching internally, so batch_size=None
+    # Fast dataset handles batching internally, so batch_size=None
     # It also has its own producer thread, so num_workers=0 is usually best to avoid overhead/duplication
     dataloader = DataLoader(dataset, batch_size=None, num_workers=0, pin_memory=True)
     
@@ -77,7 +77,7 @@ def train(args):
     
     # ... (previous setup code) ...
     
-    print("Starting training with BF16 Mixed Precision & Packed Loader...")
+    print("Starting training with BF16 Mixed Precision & Fast Loader...")
     step = 0
     pbar = tqdm(total=config.num_steps)
     
