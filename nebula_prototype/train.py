@@ -21,6 +21,11 @@ def train(args):
     
     config = NEBULA_CONFIGS[args.config]
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    
+    # Optimization: Tensor Cores
+    if torch.cuda.is_available():
+        torch.set_float32_matmul_precision('high')
+        
     print(f"Using device: {device}")
     print(f"Loading config: {args.config}")
     
@@ -55,9 +60,7 @@ def train(args):
     
     # Data (Optimized)
     # Increase num_workers for H100 to avoid CPU bottleneck
-    dataloader = get_dataloader(split="train", seq_len=config.seq_len, batch_size=config.batch_size)
-    # Note: get_dataloader in fineweb_loader.py needs to support num_workers/pin_memory args 
-    # or we rely on default. For now, we assume standard loader but we should check it.
+    dataloader = get_dataloader(split="train", seq_len=config.seq_len, batch_size=config.batch_size, num_workers=8)
     
     model.train()
     
