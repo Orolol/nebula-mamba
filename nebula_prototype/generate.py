@@ -1,0 +1,84 @@
+import torch
+import torch.nn.functional as F
+import argparse
+from transformers import GPT2TokenizerFast
+from model.nebula import NebulaModel
+from model.config import NEBULA_CONFIGS
+
+def generate(args):
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    
+    # Load Config & Model
+    config = NEBULA_CONFIGS[args.config]
+    model = NebulaModel(config).to(device)
+    
+    # Load Checkpoint
+    print(f"Loading checkpoint from {args.checkpoint}...")
+    # Note: If model was compiled, state_dict keys might have '_orig_mod' prefix. 
+    # For prototype simplicity, we assume standard loading or user handles prefix.
+    state_dict = torch.load(args.checkpoint, map_location=device)
+    model.load_state_dict(state_dict)
+    model.eval()
+    
+    tokenizer = GPT2TokenizerFast.from_pretrained("gpt2")
+    mask_token_id = 50256
+    
+    # Initial State: Fully Masked Sequence
+    seq_len = 64 # Generate short sequence
+    input_ids = torch.full((1, seq_len), mask_token_id, dtype=torch.long, device=device)
+    
+    # Reverse Diffusion (Simplified Iterative Decoding)
+    # In a real diffusion model, we'd use a noise scheduler. 
+    # Here we do "Mask-Predict-Iterative" (like MaskGIT)
+    
+    num_steps = 10 # Number of unmasking steps
+    print("Generating...")
+    
+    for step in range(num_steps):
+        with torch.no_grad():
+            logits = model(input_ids)
+            probs = F.softmax(logits, dim=-1)
+            
+            # Sample tokens
+            # Strategy: Confidence-based unmasking
+            # 1. Get max prob and token for each position
+            max_probs, pred_ids = torch.max(probs, dim=-1)
+            
+            # 2. Determine how many tokens to unmask this step
+            # Linear schedule: unmask N/steps tokens per step
+            tokens_to_keep = int(seq_len * (step + 1) / num_steps)
+            
+            # 3. Keep the most confident predictions
+            # We want to keep tokens that are ALREADY unmasked + new confident ones
+            # But for simple MaskGIT: we re-predict everything, and keep top-k confident
+            
+            # Add noise/randomness to confidence to avoid deterministic loops? 
+            # For prototype: just take top-k confidence
+            
+            threshold_idx = torch.topk(max_probs, k=tokens_to_keep, dim=1).indices
+            
+            # Create new input
+            new_input = torch.full_like(input_ids, mask_token_id)
+            
+            # Scatter predicted tokens at confident positions
+            # We need to be careful to preserve batch dim
+            for b in range(input_ids.shape[0]):
+                indices = threshold_idx[b]
+                new_input[b, indices] = pred_ids[b, indices]
+            
+            input_ids = new_input
+            
+            # Decode current state
+            text = tokenizer.decode(input_ids[0], skip_special_tokens=False)
+            print(f"Step {step+1}/{num_steps}: {text}")
+
+    print("\nFinal Generation:")
+    print(tokenizer.decode(input_ids[0], skip_special_tokens=True))
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--config", type=str, default="small", help="Model config used for training")
+    parser.add_argument("--checkpoint", type=str, required=True, help="Path to checkpoint")
+    args = parser.parse_args()
+    
+    generate(args)

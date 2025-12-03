@@ -13,10 +13,6 @@ class NebulaModel(nn.Module):
         
         self.layers = nn.ModuleList([])
         for _ in range(config.num_layers):
-            # Interleave Mamba and Experts? Or Mamba then Experts?
-            # Standard Transformer: Attention -> AddNorm -> FFN -> AddNorm
-            # Nebula: BiMamba -> AddNorm -> SpatialExperts -> AddNorm
-            
             layer = nn.ModuleDict({
                 'mixer': BiMambaBlock(config.d_model),
                 'norm1': nn.LayerNorm(config.d_model),
