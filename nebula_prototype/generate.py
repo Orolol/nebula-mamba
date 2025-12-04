@@ -48,12 +48,17 @@ def generate(args):
     for step in range(num_steps):
         with torch.no_grad():
             logits = model(input_ids)
+            
+            # Apply temperature
+            logits = logits / args.temperature
             probs = F.softmax(logits, dim=-1)
             
-            # Sample tokens
-            # Strategy: Confidence-based unmasking
-            # 1. Get max prob and token for each position
-            max_probs, pred_ids = torch.max(probs, dim=-1)
+            # Sample tokens (Stochastic) instead of Greedy (Argmax)
+            # This helps break repetitive loops and adds variety
+            pred_ids = torch.multinomial(probs.view(-1, config.vocab_size), 1).view(input_ids.shape)
+            
+            # Get confidence of the sampled tokens
+            max_probs = torch.gather(probs, -1, pred_ids.unsqueeze(-1)).squeeze(-1)
             
             # 2. Determine how many tokens to unmask this step
             # Linear schedule: unmask N/steps tokens per step
@@ -61,11 +66,6 @@ def generate(args):
             
             # 3. Keep the most confident predictions
             # We want to keep tokens that are ALREADY unmasked + new confident ones
-            # But for simple MaskGIT: we re-predict everything, and keep top-k confident
-            
-            # Add noise/randomness to confidence to avoid deterministic loops? 
-            # For prototype: just take top-k confidence
-            
             threshold_idx = torch.topk(max_probs, k=tokens_to_keep, dim=1).indices
             
             # Create new input
@@ -90,6 +90,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=str, default="small", help="Model config used for training")
     parser.add_argument("--checkpoint", type=str, required=True, help="Path to checkpoint")
+    parser.add_argument("--temperature", type=float, default=1.0, help="Sampling temperature")
     args = parser.parse_args()
     
     generate(args)
