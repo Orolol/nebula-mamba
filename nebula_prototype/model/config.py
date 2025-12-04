@@ -25,7 +25,7 @@ NEBULA_CONFIGS = {
     "base": NebulaConfig(
         d_model=512,
         num_layers=12,
-        num_heads=8,
+        num_heads=12,
         batch_size=16
     ),
     "500M": NebulaConfig(
