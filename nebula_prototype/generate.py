@@ -19,14 +19,13 @@ DEFAULT_PROMPTS = [
     "According to recent studies",
 ]
 
-def generate(args):
+def load_model(args):
+    """Load model and tokenizer once."""
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # Load Config & Model
     config = NEBULA_CONFIGS[args.config]
     model = NebulaModel(config).to(device)
 
-    # Load Checkpoint
     print(f"Loading checkpoint from {args.checkpoint}...")
     state_dict = torch.load(args.checkpoint, map_location=device)
 
@@ -44,47 +43,34 @@ def generate(args):
     model.eval()
 
     tokenizer = GPT2TokenizerFast.from_pretrained("gpt2")
+
+    return model, tokenizer, config, device
+
+
+def generate_one(model, tokenizer, config, device, args, prompt=None):
+    """Generate a single sequence."""
     mask_token_id = 50256
-
-    # Déterminer le prompt
-    if args.prompt:
-        prompt = args.prompt
-    elif args.random_prompt:
-        import random
-        prompt = random.choice(DEFAULT_PROMPTS)
-    else:
-        prompt = None
-
     seq_len = args.seq_len
 
     # Initialiser la séquence
     if prompt:
-        print(f"Starting with prompt: \"{prompt}\"")
         prompt_ids = tokenizer.encode(prompt, add_special_tokens=False)
         prompt_len = len(prompt_ids)
 
         if prompt_len >= seq_len:
-            print(f"Warning: prompt ({prompt_len} tokens) >= seq_len ({seq_len}), truncating")
             prompt_ids = prompt_ids[:seq_len - 1]
             prompt_len = len(prompt_ids)
 
-        # Créer la séquence : prompt + masked tokens
         input_ids = torch.full((1, seq_len), mask_token_id, dtype=torch.long, device=device)
         input_ids[0, :prompt_len] = torch.tensor(prompt_ids, dtype=torch.long, device=device)
 
-        # Créer un masque pour savoir quelles positions sont "fixes" (le prompt)
         fixed_mask = torch.zeros(seq_len, dtype=torch.bool, device=device)
         fixed_mask[:prompt_len] = True
     else:
-        print("Starting with fully masked sequence")
         input_ids = torch.full((1, seq_len), mask_token_id, dtype=torch.long, device=device)
         fixed_mask = torch.zeros(seq_len, dtype=torch.bool, device=device)
-    
-    # Reverse Diffusion (Simplified Iterative Decoding)
-    # Here we do "Mask-Predict-Iterative" (like MaskGIT)
 
     num_steps = args.num_steps
-    print(f"Generating in {num_steps} steps...")
 
     # Nombre de tokens à générer (exclut les tokens fixes du prompt)
     num_fixed = fixed_mask.sum().item()
@@ -130,11 +116,11 @@ def generate(args):
             input_ids = new_input
 
             # Decode current state
-            text = tokenizer.decode(input_ids[0], skip_special_tokens=False)
-            print(f"Step {step+1}/{num_steps}: {text}")
+            if args.show_steps:
+                text = tokenizer.decode(input_ids[0], skip_special_tokens=False)
+                print(f"Step {step+1}/{num_steps}: {text}")
 
-    print("\nFinal Generation:")
-    print(tokenizer.decode(input_ids[0], skip_special_tokens=True))
+    return tokenizer.decode(input_ids[0], skip_special_tokens=True)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Generate text with Nebula model")
@@ -145,6 +131,8 @@ if __name__ == "__main__":
     parser.add_argument("--random-prompt", action="store_true", help="Use a random predefined prompt")
     parser.add_argument("--seq-len", type=int, default=64, help="Total sequence length to generate (default: 64)")
     parser.add_argument("--num-steps", type=int, default=20, help="Number of denoising steps (default: 20)")
+    parser.add_argument("--show-steps", action="store_true", help="Show intermediate generation steps")
+    parser.add_argument("--num-generations", type=int, default=1, help="Number of generations to produce (default: 1)")
     parser.add_argument("--list-prompts", action="store_true", help="List available default prompts and exit")
     args = parser.parse_args()
 
@@ -154,4 +142,27 @@ if __name__ == "__main__":
             print(f"  {i+1}. {p}")
         exit(0)
 
-    generate(args)
+    # Load model once
+    model, tokenizer, config, device = load_model(args)
+
+    # Determine prompt
+    if args.prompt:
+        prompt = args.prompt
+    elif args.random_prompt:
+        import random
+        prompt = random.choice(DEFAULT_PROMPTS)
+    else:
+        prompt = None
+
+    if prompt:
+        print(f"Prompt: \"{prompt}\"")
+
+    # Generate multiple sequences
+    for i in range(args.num_generations):
+        if args.num_generations > 1:
+            print(f"\n{'='*50}")
+            print(f"Generation {i+1}/{args.num_generations}")
+            print('='*50)
+
+        result = generate_one(model, tokenizer, config, device, args, prompt)
+        print(f"\nResult: {result}")
